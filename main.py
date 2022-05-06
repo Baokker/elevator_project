@@ -26,12 +26,34 @@ class ElevatorState(Enum):
     open_door = 2
     closing_door = 3
     fault = 4
+    going_up = 5
+    going_down = 6
 
 
 # 电梯的移动状态 包括静止 向上 向下
 class MoveState(Enum):
     up = 2
     down = 3
+
+
+# 外部按钮产生的任务的分配状态 包括未分配 等待 完成
+class OuterTaskState(Enum):
+    unassigned = 1
+    waiting = 2
+    finished = 3
+
+
+# 描述一个内部数字按下产生的任务
+class InnerTask:
+    def __init__(self, target):
+        self.target = target  # 目标楼层
+
+
+class OuterTask:
+    def __init__(self, target, move_state, state=OuterTaskState.unassigned):  # the task is unfinished by default
+        self.target = target  # 目标楼层
+        self.move_state = move_state  # 需要的电梯运行方向
+        self.state = state  # 是否完成（默认未完成）
 
 
 # # 内部按钮产生的需求（是一个二维数组）
@@ -75,20 +97,6 @@ for qwerty in range(ELEVATOR_NUM):
 mutex = QMutex()
 
 
-# 描述一个内部数字按下产生的任务
-class InnerTask:
-    def __init__(self, target, state=False):  # the task is unfinished by default
-        self.target = target  # 目标楼层
-        self.state = state  # 是否完成（默认未完成）
-
-
-class OuterTask:
-    def __init__(self, target, move_state, state=False):  # the task is unfinished by default
-        self.target = target  # 目标楼层
-        self.move_state = move_state  # 需要的电梯运行方向
-        self.state = state  # 是否完成（默认未完成）
-
-
 class Elevator(QThread):
     def __init__(self, elev_id):
         super().__init__()  # 父类构造函数
@@ -98,6 +106,11 @@ class Elevator(QThread):
     # 移动一层楼
     # 方向由参数确定
     def go_one_floor(self, move_state):
+        if move_state == MoveState.up:
+            elevator_states[self.elev_id] = ElevatorState.going_up
+        elif move_state == MoveState.down:
+            elevator_states[self.elev_id] = ElevatorState.going_down
+
         has_slept_time = 0
         while has_slept_time != TIME_PER_FLOOR:
             # 需要先放开锁 不然别的线程不能运行
@@ -106,12 +119,18 @@ class Elevator(QThread):
             has_slept_time += self.time_slice
             # 锁回来
             mutex.lock()
+            # 如果此时出故障了..
+            if elevator_states[self.elev_id] == ElevatorState.fault:
+                self.fault_tackle()
 
         if move_state == MoveState.up:
             cur_floor[self.elev_id] += 1
         elif move_state == MoveState.down:
             cur_floor[self.elev_id] -= 1
+        elevator_states[self.elev_id] = ElevatorState.normal
         print(self.elev_id, "号现在在", cur_floor[self.elev_id], "楼")
+        if elevator_states[self.elev_id] == ElevatorState.fault:
+            self.fault_tackle()
 
     # 一次门的操作 包括开门和关门
     def door_operation(self):
@@ -119,7 +138,10 @@ class Elevator(QThread):
         open_time = 0.0
         elevator_states[self.elev_id] = ElevatorState.opening_door
         while True:
-            if is_open_button_clicked[self.elev_id] == True:
+            if elevator_states[self.elev_id] == ElevatorState.fault:
+                self.fault_tackle()
+                break
+            elif is_open_button_clicked[self.elev_id] == True:
                 # 门正在关上..
                 if elevator_states[self.elev_id] == ElevatorState.closing_door:
                     elevator_states[self.elev_id] = ElevatorState.opening_door
@@ -130,16 +152,11 @@ class Elevator(QThread):
 
                 is_open_button_clicked[self.elev_id] = False
 
-            if is_close_button_clicked[self.elev_id] == True:
+            elif is_close_button_clicked[self.elev_id] == True:
                 elevator_states[self.elev_id] = ElevatorState.closing_door
                 open_time = 0
 
                 is_close_button_clicked[self.elev_id] = False
-
-            if elevator_states[self.elev_id] == ElevatorState.fault:
-                open_progress[self.elev_id] = 0.0
-                break
-
 
             # 更新时间
             # 门正在打开
@@ -180,55 +197,73 @@ class Elevator(QThread):
                     elevator_states[self.elev_id] = ElevatorState.normal
                     break
 
+    # 当故障发生时 清除原先的所有任务
+    def fault_tackle(self):
+        elevator_states[self.elev_id] = ElevatorState.fault
+        open_progress[self.elev_id] = 0.0
+        is_open_button_clicked[self.elev_id] = False
+        is_close_button_clicked[self.elev_id] = False
+        elevator_states[self.elev_id] = ElevatorState.fault
+        for outer_task in outer_requests:
+            if outer_task.state == OuterTaskState.waiting:
+                if outer_task.target in up_targets[self.elev_id] or outer_task.target in down_targets[self.elev_id]:
+                    outer_task.state = OuterTaskState.unassigned  # 把原先分配给它的任务交给handler重新分配
+        up_targets[self.elev_id] = []
+        down_targets[self.elev_id] = []
+
     def run(self):
         while True:
             mutex.lock()
             if elevator_states[self.elev_id] == ElevatorState.fault:
+                self.fault_tackle()
                 mutex.unlock()
                 continue
 
             # 向上扫描状态时
             if move_states[self.elev_id] == MoveState.up:
-                if up_targets[self.elev_id] != [] and up_targets[self.elev_id][0] == cur_floor[self.elev_id]:
-                    self.door_operation()
-                elif up_targets[self.elev_id] != [] and up_targets[self.elev_id][0] > cur_floor[self.elev_id]:
-                    self.go_one_floor(MoveState.up)
+                if up_targets[self.elev_id] != []:
                     if up_targets[self.elev_id][0] == cur_floor[self.elev_id]:
                         self.door_operation()
-
-                elif up_targets == [] and down_targets != []:
-                    move_states[self.elev_id] = MoveState.down
-
-                # 到达以后 把完成的任务设为true
-                if up_targets[self.elev_id] != []:
+                    elif up_targets[self.elev_id][0] > cur_floor[self.elev_id]:
+                        self.go_one_floor(MoveState.up)
+                        if up_targets[self.elev_id] != [] and up_targets[self.elev_id][0] == cur_floor[self.elev_id]:
+                            self.door_operation()
+                    # 到达以后 把完成的任务设为true
                     # 内部的任务
-                    if cur_floor[self.elev_id] == up_targets[self.elev_id][0]:
+                    if up_targets[self.elev_id] != [] and cur_floor[self.elev_id] == up_targets[self.elev_id][0]:
                         up_targets[self.elev_id].pop(0)
                     # 外部按钮的任务
                     for outer_task in outer_requests:
-                        if outer_task.target == cur_floor[self.elev_id] and outer_task.move_state == MoveState.up:
-                            outer_task.state = True
+                        if outer_task.target == cur_floor[
+                            self.elev_id] and outer_task.move_state == MoveState.up:
+                            outer_task.state = OuterTaskState.finished
+                # 当没有上行目标而出现下行目标时 更换状态
+                elif up_targets[self.elev_id] == [] and down_targets[self.elev_id] != []:
+                    move_states[self.elev_id] = MoveState.down
+
+
 
             # 向下扫描状态时
-            if move_states[self.elev_id] == MoveState.down:
-                if down_targets[self.elev_id] != [] and down_targets[self.elev_id][0] == cur_floor[self.elev_id]:
-                    self.door_operation()
-                elif down_targets[self.elev_id] != [] and down_targets[self.elev_id][0] < cur_floor[self.elev_id]:
-                    self.go_one_floor(MoveState.down)
+            elif move_states[self.elev_id] == MoveState.down:
+                if down_targets[self.elev_id] != []:
                     if down_targets[self.elev_id][0] == cur_floor[self.elev_id]:
                         self.door_operation()
-                elif down_targets == [] and up_targets != []:
-                    move_states[self.elev_id] = MoveState.up
-
+                    elif down_targets[self.elev_id][0] < cur_floor[self.elev_id]:
+                        self.go_one_floor(MoveState.down)
+                        if down_targets[self.elev_id] != [] and down_targets[self.elev_id][0] == cur_floor[
+                            self.elev_id]:
+                            self.door_operation()
                     # 将已经完成的任务设为true
-                if down_targets[self.elev_id] != []:
                     # 内部的任务
-                    if cur_floor[self.elev_id] == down_targets[self.elev_id][0]:
+                    if down_targets[self.elev_id] != [] and cur_floor[self.elev_id] == down_targets[self.elev_id][0]:
                         down_targets[self.elev_id].pop(0)
                     # 外部按钮的任务
                     for outer_task in outer_requests:
                         if outer_task.target == cur_floor[self.elev_id] and outer_task.move_state == MoveState.down:
-                            outer_task.state = True
+                            outer_task.state = OuterTaskState.finished
+                # 当没有下行目标而出现上行目标时 更换状态
+                elif down_targets[self.elev_id] == [] and up_targets[self.elev_id] != []:
+                    move_states[self.elev_id] = MoveState.up
 
             mutex.unlock()
 
@@ -246,38 +281,52 @@ class Handler(QThread):
             # handler只处理外面按钮产生的任务安排..
             # 找到距离最短的电梯编号..
             for outer_task in outer_requests:
-                min_distance = ELEVATOR_FLOORS + 1
-                target_id = -1
-                for i in range(ELEVATOR_NUM):
-                    if elevator_states[i] == ElevatorState.fault:
-                        continue
-                    if (move_states[i] == MoveState.up and cur_floor[i] <= outer_task.target) or \
-                            (move_states[i] == MoveState.down and cur_floor[i] >= outer_task.target):
+                if outer_task.state == OuterTaskState.unassigned:  # 如果未分配..
+                    min_distance = ELEVATOR_FLOORS + 1
+                    target_id = -1
+                    for i in range(ELEVATOR_NUM):
+                        if elevator_states[i] == ElevatorState.fault:
+                            continue
+                        # 在相同一层 但是没有在上升 下降 或者故障
+                        if cur_floor[i] == outer_task.target and \
+                                elevator_states[i] not in [ElevatorState.going_down, ElevatorState.going_up]:
+                            target_id = i
+                            break
+                        # if (move_states[i] == MoveState.up and cur_floor[i] < outer_task.target) or \
+                        #         (move_states[i] == MoveState.down and cur_floor[i] > outer_task.target):
                         distance = abs(cur_floor[i] - outer_task.target)
                         if distance < min_distance:
                             min_distance = distance
                             target_id = i
 
-                # 假如找到了 对应添加任务..
-                if target_id != -1:
-                    if cur_floor[target_id] < outer_task.target and outer_task.target not in up_targets[
-                        target_id]:  # up 
-                        up_targets[target_id].append(outer_task.target)
-                        up_targets[target_id].sort()
-                        print(up_targets)
-                    elif cur_floor[target_id] > outer_task.target and outer_task.target not in down_targets[
-                        target_id]:  # down
-                        down_targets[target_id].append(outer_task.target)
-                        down_targets[target_id].sort(reverse=True)  # 这里需要降序！ 例如，[20,19,..1]
-                        print(down_targets)
-                    elif cur_floor[target_id] == outer_task.target:
-                        if outer_task.move_state == MoveState.up and outer_task.target not in up_targets[
-                        target_id]:
+                    # 假如找到了 对应添加任务..
+                    if target_id != -1:
+                        if cur_floor[target_id] == outer_task.target:
+                            if outer_task.move_state == MoveState.up and outer_task.target not in up_targets[
+                                target_id]:
+                                up_targets[target_id].append(outer_task.target)
+                                up_targets[target_id].sort()
+                                print(up_targets)
+                                # 设为等待态
+
+                                outer_task.state = OuterTaskState.waiting
+
+                            elif outer_task.move_state == MoveState.down and outer_task.target not in down_targets[
+                                target_id]:
+                                down_targets[target_id].append(outer_task.target)
+                                down_targets[target_id].sort(reverse=True)  # 这里需要降序！ 例如，[20,19,..1]
+                                print(down_targets)
+                                # 设为等待态
+
+                                outer_task.state = OuterTaskState.waiting
+
+                        elif cur_floor[target_id] < outer_task.target and outer_task.target not in up_targets[
+                            target_id]:  # up
                             up_targets[target_id].append(outer_task.target)
                             up_targets[target_id].sort()
                             print(up_targets)
-                        elif outer_task.move_state == MoveState.down and outer_task.target not in down_targets[
-                        target_id]:
+                        elif cur_floor[target_id] > outer_task.target and outer_task.target not in down_targets[
+                            target_id]:  # down
                             down_targets[target_id].append(outer_task.target)
                             down_targets[target_id].sort(reverse=True)  # 这里需要降序！ 例如，[20,19,..1]
                             print(down_targets)
@@ -302,8 +351,8 @@ class Handler(QThread):
             mutex.unlock()
 
             mutex.lock()
-            # 查看哪些任务已经完成了 移除未完成的..
-            outer_requests = [task for task in outer_requests if task.state == False]
+            # 查看哪些任务已经完成了 移除已经完成的..
+            outer_requests = [task for task in outer_requests if task.state != OuterTaskState.finished]
             # for i in range(ELEVATOR_NUM):
             #     inner_requests[i] = [task for task in inner_requests[i] if task.state == False]
 
@@ -312,8 +361,9 @@ class Handler(QThread):
 
 class ElevatorUi(QWidget):
     def __init__(self):
-        super().__init__()
+        super().__init__() # 父类构造函数
         self.output = None
+        # 各种
         self.__floor_displayers = []
         self.__inner_num_buttons = []
         self.__inner_open_buttons = []
@@ -435,7 +485,8 @@ class ElevatorUi(QWidget):
             mutex.unlock()
             return
 
-        if elevator_states[elevator_id] == ElevatorState.closing_door or elevator_states[elevator_id] == ElevatorState.open_door:
+        if elevator_states[elevator_id] == ElevatorState.closing_door or elevator_states[
+            elevator_id] == ElevatorState.open_door:
             is_open_button_clicked[elevator_id] = True
             is_close_button_clicked[elevator_id] = False
 
@@ -450,7 +501,8 @@ class ElevatorUi(QWidget):
             mutex.unlock()
             return
 
-        if elevator_states[elevator_id] == ElevatorState.opening_door or elevator_states[elevator_id] == ElevatorState.open_door:
+        if elevator_states[elevator_id] == ElevatorState.opening_door or elevator_states[
+            elevator_id] == ElevatorState.open_door:
             is_close_button_clicked[elevator_id] = True
             is_open_button_clicked[elevator_id] = False
 
@@ -464,7 +516,14 @@ class ElevatorUi(QWidget):
             elevator_states[elevator_id] = ElevatorState.fault
 
             self.__inner_fault_buttons[elevator_id].setStyleSheet("background-color : yellow")
+            for button in self.__inner_num_buttons[elevator_id]:
+                button.setStyleSheet("background-color : rgb(255,255,255)")
+            self.__inner_open_buttons[elevator_id].setStyleSheet("background-color : None")
+            self.__inner_close_buttons[elevator_id].setStyleSheet("background-color : None")
+
             self.output.append(str(elevator_id) + "电梯故障!")
+
+
         else:
             elevator_states[elevator_id] = ElevatorState.normal
 
@@ -527,11 +586,12 @@ class ElevatorUi(QWidget):
             if not is_close_button_clicked[i]:
                 self.__inner_close_buttons[i].setStyleSheet("background-color : None")
 
-            # 对内部的按钮，如果不是normal or falut状态的话，则设进度条
-            if elevator_states[i] != ElevatorState.fault and elevator_states[i] != ElevatorState.normal:
+            # 对内部的按钮，如果在开门或关门状态的话，则设进度条
+            if elevator_states[i] in [ElevatorState.opening_door, ElevatorState.open_door, ElevatorState.closing_door]:
                 self.__inner_num_buttons[i][ELEVATOR_FLOORS - cur_floor[i]].setStyleSheet(
                     "background-color : rgb(255," + str(int(255 * (1 - open_progress[i]))) + ",255)")
 
+        mutex.unlock()
         # 对外部来说，遍历任务，找出未完成的设为红色，其他设为默认none
         for button in self.__outer_up_buttons:
             button.setStyleSheet("background-color : None")
@@ -539,28 +599,15 @@ class ElevatorUi(QWidget):
         for button in self.__outer_down_buttons:
             button.setStyleSheet("background-color : None")
 
+        mutex.lock()
         for outer_task in outer_requests:
-            if outer_task.state == False:
+            if outer_task.state != OuterTaskState.finished:
                 if outer_task.move_state == MoveState.up:
                     self.__outer_up_buttons[ELEVATOR_FLOORS - outer_task.target - 1].setStyleSheet(
                         "background-color : pink")
                 elif outer_task.move_state == MoveState.down:
                     self.__outer_down_buttons[ELEVATOR_FLOORS - outer_task.target].setStyleSheet(
                         "background-color : pink")
-
-        # unfinished_up_floors = [outer_task.target for outer_task in outer_requests if outer_task.state == False and outer_task.move_state == MoveState.up]
-        # unfinished_down_floors = [outer_task.target for outer_task in outer_requests if outer_task.state == False and outer_task.move_state == MoveState.down]
-        #
-        # for i in range(1, ELEVATOR_FLOORS + 1):
-        #     if i in unfinished_up_floors:
-        #         self.__outer_up_buttons[ELEVATOR_FLOORS - cur_floor[i] + 1].setStyleSheet("background-color : pink")
-        #     else:
-        #         self.__outer_up_buttons[ELEVATOR_FLOORS - cur_floor[i] + 1].setStyleSheet("background-color : None")
-        #
-        #     if i in unfinished_down_floors:
-        #         self.__outer_down_buttons[ELEVATOR_FLOORS - cur_floor[i]].setStyleSheet("background-color : pink")
-        #     else:
-        #         self.__outer_down_buttons[ELEVATOR_FLOORS - cur_floor[i]].setStyleSheet("background-color : None")
 
         mutex.unlock()
 
