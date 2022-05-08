@@ -1,2 +1,7 @@
 # pycharm cache
 .idea/
+
+# pyinstaller
+build/
+dist/
+elevator_simulator.spec
